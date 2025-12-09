@@ -1,5 +1,8 @@
+import traceback
+
 import numpy as np
 import sys
+from typing import List, Dict, Any, Optional, Callable, Tuple
 
 # ----------------------------------------------------------------------
 # 步骤 1: 定义常量与参数 (基于 run_optimization.py)
@@ -88,7 +91,7 @@ def get_intermediate_vars(x):
 
     # 政府财政 Phi (亿元)
     L0 = lambda_financial_income * Rev
-    tC = 0.01;
+    tC = 0.01
     tO = 0.01
     Phi = L0 * (1 - Tau) + tC * P_C * AC + tO * P_O * AO - k_ext * (Delta ** 2)
 
@@ -127,6 +130,18 @@ def utility_V(x, vars):
     term2 = eta[1] * np.log(s / rho_prop + epsilon)
     term3 = eta[2] * np.log(Cash_share / rho_cash + epsilon)
     return term1 + term2 + term3
+
+
+def check_constraints_lower_bound(x, vars_dict):
+    """保底方案下的约束(s=25%、Δ=0)"""
+    base_constraints_met, violations = check_constraints(x, vars_dict)
+    if x[3] != 0:
+        base_constraints_met = False
+        violations.append("容积率不能上溢: x[3]只能为0")
+    if not np.isclose(vars_dict['s'], 0.25, atol=1e-3):
+        base_constraints_met = False
+        violations.append("产业占比应该只满足下限要求: s只能为0.25")
+    return base_constraints_met, violations
 
 
 def check_constraints(x, vars_dict):
@@ -184,7 +199,8 @@ def check_constraints(x, vars_dict):
 # 步骤 4: 定义 Agent 可用的主工具
 # ----------------------------------------------------------------------
 
-def evaluate_proposal(AR: float, AC: float, AO: float, Delta: float, Tau: float):
+def evaluate_proposal(AR: float, AC: float, AO: float, Delta: float, Tau: float,
+                      check_function: Callable[[List[float], dict], Tuple[bool, List[str]]] = check_constraints):
     """
     Agent 的核心工具。
     输入决策向量 x = [AR, AC, AO, Delta, Tau]，
@@ -197,7 +213,7 @@ def evaluate_proposal(AR: float, AC: float, AO: float, Delta: float, Tau: float)
         vars_dict = get_intermediate_vars(x)
 
         # 2. 检查约束
-        constraints_met, violations = check_constraints(x, vars_dict)
+        constraints_met, violations = check_function(x, vars_dict)
 
         if not constraints_met:
             return {
@@ -243,7 +259,44 @@ def evaluate_proposal(AR: float, AC: float, AO: float, Delta: float, Tau: float)
             }
         }
     except Exception as e:
+        print('评价方案出现报错: ', traceback.format_exc())
         return {
             "status": "ERROR",
             "message": f"计算中出现意外错误: {str(e)}"
         }
+
+
+def evaluate_wNBS(AR: float, AC: float, AO: float, Delta: float, Tau: float, utility_lower_bound: dict,
+                  strength: dict, eps=1e-6):
+    """
+
+    :param AR:
+    :param AC:
+    :param AO:
+    :param Delta:
+    :param Tau:
+    :param utility_lower_bound: {U_G: float, U_D: float, U_V: float}
+    :param strength:  三方的谈判实力系数 {G: float, D: float, V: float}
+    :return:
+    """
+    roles = ('G', 'D', 'V')
+
+    if sum(strength.values()) != 1:
+        strength_denominator = sum(strength.values())
+        strength = {k: v / strength_denominator for k, v in strength.items()}
+
+    for role in roles:
+        assert role in strength, f"缺少 {role} 的strength"
+        assert f'U_{role}' in utility_lower_bound, f"保底方案缺少U_{role}的效用值"
+
+    evaluation = evaluate_proposal(AR, AC, AO, Delta, Tau)
+    if 'utilities' not in evaluation:
+        return evaluation
+
+    # print(f'效用: {evaluation["utilities"]}')
+    wNBS = sum([strength[role] * (float(evaluation['utilities'][f'U_{role}']) -
+                                        utility_lower_bound[f'U_{role}'] + eps)
+                for role in roles])
+    print(f'wNBS: {wNBS:.2f}')
+    evaluation['utilities']['wNBS'] = wNBS
+    return evaluation

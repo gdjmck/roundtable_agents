@@ -1,13 +1,17 @@
 import json
-import numpy as np
+import traceback
+# from langchain.globals import set_debug
+# set_debug(True)
+import langchain_core
+import functools
 # 假设这是我们上一轮定义的计算核心 (Calculator)
 # 包含 evaluate_proposal, utility_G, utility_D, utility_V 等函数
 import LLM_optimization as math_core
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Callable, Tuple
 from llm_model import llm
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage
 from data_model import AgentAction, ActionType
-from prompt import WORLD_CONTEXT, AGENT_DEV_PROMPT, AGENT_GOV_PROMPT, AGENT_VILLAGE_PROMPT, prompt_template, parser
+from prompt import WORLD_CONTEXT, AGENT_DEV_PROMPT, AGENT_GOV_PROMPT, AGENT_VILLAGE_PROMPT, prompt_template
 from langchain_core.output_parsers import PydanticOutputParser
 from color_print import gov_print, dev_print, village_print
 
@@ -37,16 +41,19 @@ def extract_speech(llm_response_json: str) -> str:
 
 
 class RoundTableLLM:
-    def __init__(self, llm, data_model_cls, max_round: int=5):
+    def __init__(self, llm, data_model_cls,
+                 evaluation_function: Callable[[List[float]], Tuple[bool, List[str]]]=math_core.evaluate_proposal,
+                 baseline_vector: List[float] = [75.91, 8.35, 32.77, 0.0, 0.20], max_round: int = 5):
         self._llm = llm  # 可以直接跳过prompt中指定输出字段的步骤
         self.parser = PydanticOutputParser(pydantic_object=data_model_cls)
+        self.evaluation_function = evaluation_function
         self.max_round = max_round  # 最大的讨论轮数
         self.current_round = 0
         self.history = []  # 全局会议记录
         self.history_length = 6
         self.proposals_log = []  # 记录所有被提出的合法向量
-        self.baseline_vector = [75.91, 8.35, 32.77, 0.0, 0.20]
-        self.latest_vector = [75.91, 8.35, 32.77, 0.0, 0.20]
+        self.baseline_vector = list(baseline_vector)
+        self.latest_vector = list(baseline_vector)
         self.last_speaker = '主持人'
 
         # 定义 Agents
@@ -65,8 +72,8 @@ class RoundTableLLM:
             }
         }
         self.agents = {
-            name: ReflectiveAgent(name, llm, info['system'], style=info['style']) for name, info in
-            self.characters.items()
+            name: ReflectiveAgent(name, llm, info['system'], evaluation_function=self.evaluation_function,
+                                  style=info['style']) for name, info in self.characters.items()
         }
         self._init_history()
 
@@ -150,20 +157,33 @@ class ReflectiveAgent:
     一个封装了“提议-评估-修正”循环的博弈 Agent。
     """
 
-    def __init__(self, name, llm, system_prompt, style: str = '', max_retry: int = 3):
+    def __init__(self, name, llm, system_prompt, evaluation_function: Callable[[List[float]], Dict[str, float]],
+                 style: str = '', max_retry: int = 1):
         """
 
         :param name:
         :param llm: langchain ChatOpenAI llm
         :param system_prompt:
+        :param evaluation_function: 对决策向量进行规则检验的方法
         :param style: 人设风格
         """
         self.name = name
         self.max_retry = max_retry
         self.system_prompt = SystemMessage(content=system_prompt)
+        self.evaluation_function = evaluation_function
         self.style = style
-        self.proposal_chain = llm | PydanticOutputParser(pydantic_object=AgentAction)
+        self.parser = PydanticOutputParser(pydantic_object=AgentAction)
+        # self.parse_fixer = OutputFixingParser.from_llm(llm=llm, parser=self.parser)
+        self.proposal_chain = llm | self.parser
         print(f'{self.name} Agent初始化完毕')
+
+    def _area_hard_fix(self, propose_vector: List[float]):
+        # 通过指标闭合的方式对三个面积进行校正
+        if sum(propose_vector[:3]) != math_core.F0 * propose_vector[3] + math_core.A_total:
+            # 对融资住宅进行调整
+            new_residence_area = math_core.F0 * propose_vector[3] + math_core.A_total - sum(propose_vector[1:3])
+            propose_vector = [new_residence_area, *propose_vector[1:]]
+        return propose_vector
 
     def propose(self, history_proposal: List[BaseMessage]):
         """
@@ -173,6 +193,7 @@ class ReflectiveAgent:
         """
         default_messages = [self.system_prompt] + history_proposal
         eval_failure = None  # {'propose_vector': [], 'info': dict}
+        action_model = ActionType.ACCEPT
 
         for i in range(self.max_retry):
             if eval_failure is None:
@@ -187,11 +208,19 @@ class ReflectiveAgent:
                 messages = default_messages + [HumanMessage(content=correction_prompt)]
 
             printer[self.name](messages)
-            action_model: AgentAction = self.proposal_chain.invoke(messages)
+            try:
+                action_model: AgentAction = self.proposal_chain.invoke(messages)
+            except langchain_core.exceptions.OutputParserException:
+                continue
+            except Exception:
+                print(traceback.format_exc())
+
 
             if action_model.action == ActionType.PROPOSE_NEW:
                 # 验证新提案
-                eval_result = math_core.evaluate_proposal(*action_model.new_proposal_vector)
+                action_model.new_proposal_vector = self._area_hard_fix(action_model.new_proposal_vector)
+                printer[self.name](f"{self.name} 提出的新方案 {action_model.new_proposal_vector}")
+                eval_result = self.evaluation_function(*action_model.new_proposal_vector)  # math_core.evaluate_proposal
                 if eval_result['status'] == 'ACCEPTED':
                     return {
                         "action_model": action_model,
@@ -213,8 +242,18 @@ class ReflectiveAgent:
 
 
 if __name__ == "__main__":
-    # --- 模拟运行 ---
-    table = RoundTableLLM(llm, data_model_cls=AgentAction, max_round=10)
-    table.round_discuss()
+    stage = 1
+
+    if stage == 1:
+        # --- Stage1: 模拟运行 ---
+        table = RoundTableLLM(llm, data_model_cls=AgentAction, max_round=10)
+        table.round_discuss()
+    else:
+        init_vector = (89.262, 9.2, 27.8, 0.04, 0.15)
+        evaluation_function = functools.partial(math_core.evaluate_proposal,
+                                                check_function=math_core.check_constraints_lower_bound)
+        table = RoundTableLLM(llm, data_model_cls=AgentAction, max_round=5,
+                              baseline_vector=init_vector, evaluation_function=evaluation_function)
+        table.round_discuss()
 
     print(f'最终方案: {table.latest_vector}')

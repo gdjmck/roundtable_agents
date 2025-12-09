@@ -2,7 +2,7 @@ import json
 from enum import Enum
 from typing import Optional, Tuple, Any
 from pydantic import BaseModel, Field, ValidationError
-from langchain_core.pydantic_v1 import BaseModel, Field, create_model, validator
+# from langchain_core.pydantic_v1 import BaseModel, Field, create_model, validator
 
 
 # ----------------------------------------------------------------------
